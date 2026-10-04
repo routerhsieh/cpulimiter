@@ -9,6 +9,29 @@ import (
 	"github.com/routerhsieh/cpulimiter/movingavg"
 )
 
+func TestRunPreservesSubMicrosecondCPUDelta(t *testing.T) {
+	cfg := regressionConfig()
+	cfg.SampleEvery = time.Millisecond
+	l := New(cfg, &scriptedMeter{readings: []cpuReading{
+		{cpu: time.Second},
+		{cpu: time.Second + 500*time.Nanosecond},
+	}}, nil)
+	avg := &recordingAvg{RingAvg: movingavg.New(1), samples: make(chan float64, 1)}
+	l.avg = avg
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startController(t, l, ctx)
+	t.Cleanup(func() { cancel(); awaitStopped(t, done) })
+
+	select {
+	case sample := <-avg.samples:
+		if sample <= 0 {
+			t.Fatalf("sample=%g CPU, want a positive sample for a 500ns CPU delta", sample)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("controller did not produce a sample")
+	}
+}
+
 func TestSamplingIntervalByMode(t *testing.T) {
 	base := 100 * time.Millisecond
 	for _, mode := range []Mode{SingleCore, AllCores, Mode(99)} {

@@ -314,11 +314,8 @@ func (l *Limiter) Run(ctx context.Context) {
 			l.lastAt, l.lastCPU = now, cpu
 
 			// Instantaneous CPUs over this slice: Δcpu / Δwall (units: "CPUs").
-			var instCPUs float64
-			wallUS := float64(dtWall.Microseconds())
-			if wallUS > 0 {
-				instCPUs = float64(dtCPU.Microseconds()) / wallUS
-			}
+			// Divide durations directly to avoid truncating sub-microsecond values.
+			instCPUs := float64(dtCPU) / float64(dtWall)
 
 			// Update the average and cap, then notify waiters.
 			l.mu.Lock()
