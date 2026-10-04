@@ -1,0 +1,13 @@
+# Compiled binaries and test executables
+*.exe
+*.test
+*.test.exe
+/hashing
+
+# Generated coverage reports
+/coverage.out
+/coverage.html
+/coverage/
+
+# macOS metadata
+.DS_Store
