@@ -94,6 +94,10 @@ logical CPU. `GlobalFrac` is a fraction, not a percentage.
 | `Window` | `5 * time.Minute` | Approximate history window for the sample average. |
 | `SampleEvery` | `100 * time.Millisecond` | Base CPU sampling interval. |
 | `Hysteresis` | `0.02` | Admission margin in CPU units, not a fraction of the target. |
+| `Aging.Enabled` | `false` | Temporarily relax admission for blocked calls. |
+| `Aging.Delay` | `0` | Waiting time before aging starts; zero starts immediately. |
+| `Aging.RampDuration` | `30 * time.Second` | Time after the delay to reach the maximum boost. |
+| `Aging.MaxFracBoost` | `0.1` | Maximum additive boost to the caller's fraction. |
 
 `SingleCore` uses `GlobalFrac` directly as the CPU allowance. `AllCores` uses
 `GlobalFrac * runtime.NumCPU()` and divides the base sampling interval by that
@@ -105,11 +109,49 @@ weighted samples. This approximates a time window; delayed samples, failed
 meter reads, and sampling-cadence changes affect its actual time coverage.
 AllCores mode increases sampling overhead and history capacity on larger hosts.
 
-Nonpositive numeric settings use their defaults; NaN and infinity also default
+Nonpositive numeric settings above, except `Aging.Delay`, use their defaults; NaN and infinity also default
 for floating-point settings. In particular, `Hysteresis: 0` selects the default
 margin rather than disabling it. Modes other than `AllCores` behave as SingleCore.
 The margin supplied to a policy is capped at half the caller's allowance.
 For small CPU targets, consider an explicitly smaller margin, as in the example.
+Negative `Aging.Delay` becomes zero. Positive finite boosts above 1 are accepted;
+the effective caller fraction remains capped at 1.
+
+### Optional aging
+
+Aging is disabled by default. Enable it to give blocked callers more admission
+opportunities at the cost of temporarily narrowing their original priority gaps:
+
+```go
+cfg.Aging = cpulimit.AgingConfig{
+    Enabled:      true,
+    Delay:        5 * time.Second,
+    RampDuration: 30 * time.Second,
+    MaxFracBoost: 0.1,
+}
+```
+
+After the first rejected admission attempt, each `AwaitCapacity` call tracks its
+own elapsed waiting time. On each retry the limiter computes:
+
+```text
+progress = clamp((waited - Delay) / RampDuration, 0, 1)
+effectiveFrac = min(1, normalizedFrac + MaxFracBoost * progress)
+```
+
+With the settings above, a caller with `frac = 0.3` stays at 0.3 for five seconds,
+reaches 0.35 after twenty seconds, and reaches 0.4 after thirty-five seconds.
+Success or cancellation discards the boost; the next call starts fresh.
+Aging changes the allowance passed to either built-in policy, without changing
+the optional probability weight. Custom policies decide how to use that allowance.
+Retries normally happen on recorded samples, so aging is not an independent timer;
+failed readings or a stopped controller can prevent retries.
+
+Aging does not guarantee progress, waiter ordering, CPU shares, or Go scheduler
+priority. It never raises the caller's allowance above the global allowance;
+sampling delays, concurrent work chunks, and the power curve's upper margin can
+still allow temporary overshoot. Leave aging disabled when preserving the original
+priority thresholds is essential.
 
 ### Runtime updates
 
@@ -121,6 +163,9 @@ When the window or effective sampling interval changes, the limiter resizes its
 history, preserving the newest samples that fit. Other updates also retain
 history. Changing cadence does not reweight existing samples or recover samples
 already discarded.
+Aging updates take effect on the next admission attempt using the original wait
+start, including time spent waiting while aging was disabled. Disabling aging
+removes the boost on the next attempt.
 
 ## Admission policies
 
@@ -147,7 +192,9 @@ aggressively. A positive probability floor may admit above the nominal allowance
 within the upper margin.
 
 `AwaitCapacity(ctx, frac, weight...)` scales the global allowance by `frac`.
-Normally use `frac = 1`. A smaller fraction makes that caller wait at a lower
+Use fractions in `(0, 1]`; 1 uses the full global allowance. Finite values above
+1 are now clamped to 1; nonpositive or nonfinite values use 0.000001.
+A smaller fraction makes that caller wait at a lower
 process-wide average; it does **not** reserve an independent share for a worker
 or measure that worker's CPU usage. The optional weight defaults to 1; the power
 curve uses it as a probability multiplier, while deterministic admission ignores

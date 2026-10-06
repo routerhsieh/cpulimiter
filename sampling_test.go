@@ -98,7 +98,7 @@ func TestRuntimeModeWindowAndCadenceResize(t *testing.T) {
 	} {
 		cfg.Mode, cfg.Window, cfg.SampleEvery = update.mode, update.window, update.every
 		l.SetConfig(cfg)
-		awaitCondition(t, "mode/window/cadence update", func() bool { return l.GetConfig() == cfg })
+		awaitCondition(t, "mode/window/cadence update", func() bool { return l.GetConfig() == cfg.withDefaults() })
 		wantCapacity := sampleCapacity(cfg.Window, samplingInterval(cfg))
 		l.mu.Lock()
 		capacity, cached := avg.capacity, l.avgCPUs
@@ -159,7 +159,7 @@ func TestAllCoresControllerUsesEffectiveCadence(t *testing.T) {
 				cfg.Mode = AllCores
 				cfg.SampleEvery = time.Duration(runtime.NumCPU()) * 100 * time.Millisecond
 				l.SetConfig(cfg)
-				awaitCondition(t, "AllCores cadence application", func() bool { return l.GetConfig() == cfg })
+				awaitCondition(t, "AllCores cadence application", func() bool { return l.GetConfig() == cfg.withDefaults() })
 			}
 			deadline := time.After(500 * time.Millisecond)
 			for i := 0; i < 3; i++ {

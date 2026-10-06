@@ -40,6 +40,32 @@ type AdmissionPolicy interface {
 	CanProceed(admission.State) bool
 }
 
+// AgingConfig temporarily relaxes admission for each blocked AwaitCapacity call.
+// Aging does not guarantee progress, ordering, or CPU scheduling priority.
+type AgingConfig struct {
+	Enabled bool // Disabled by default.
+	// Delay before boosting begins. Zero starts immediately; negative uses zero.
+	Delay time.Duration
+	// Time to reach MaxFracBoost after Delay. Nonpositive uses 30 seconds.
+	RampDuration time.Duration
+	// Maximum additive fraction boost. Nonpositive or nonfinite uses 0.1.
+	// Effective fractions are still capped at 1, even for larger boosts.
+	MaxFracBoost float64
+}
+
+func (a AgingConfig) withDefaults() AgingConfig {
+	if a.Delay < 0 {
+		a.Delay = 0
+	}
+	if a.RampDuration <= 0 {
+		a.RampDuration = 30 * time.Second
+	}
+	if a.MaxFracBoost <= 0 || math.IsNaN(a.MaxFracBoost) || math.IsInf(a.MaxFracBoost, 0) {
+		a.MaxFracBoost = 0.1
+	}
+	return a
+}
+
 // Config holds live-tunable settings for the limiter. Nonpositive GlobalFrac,
 // Window, SampleEvery, and Hysteresis use defaults of 0.70, five minutes,
 // 100 milliseconds, and 0.02 CPU respectively. Nonfinite floating-point settings
@@ -59,6 +85,8 @@ type Config struct {
 	// Admission margin passed to the policy, bounded to half the allowance.
 	// Custom policies may choose whether to apply it.
 	Hysteresis float64 // margin in "CPUs", e.g., 0.02
+	// Aging applies to both built-in policies through the caller's allowance.
+	Aging AgingConfig
 }
 
 func (c Config) withDefaults() Config {
@@ -75,6 +103,7 @@ func (c Config) withDefaults() Config {
 	if out.Hysteresis <= 0 || math.IsNaN(out.Hysteresis) || math.IsInf(out.Hysteresis, 0) {
 		out.Hysteresis = 0.02
 	}
+	out.Aging = out.Aging.withDefaults()
 	return out
 }
 
@@ -197,8 +226,12 @@ func (l *Limiter) GetConfig() Config {
 // AwaitCapacity blocks until admission succeeds or ctx is canceled. Cancellation is
 // checked at entry and before every waiting-loop admission attempt.
 // frac scales the global cap: 1.0 uses the full cap and 0.5 uses half.
-// Nonpositive or nonfinite frac uses 0.000001. Fractions are eligibility thresholds, not
+// Finite frac above 1 is capped at 1; nonpositive or nonfinite frac uses 0.000001.
+// Fractions are eligibility thresholds, not
 // independent CPU reservations for workers.
+// Optional aging adds a waiting-time boost, capped at an effective frac of 1.
+// Each call starts fresh; success or cancellation discards its aging state.
+// Live aging updates preserve the wait start and apply on the next attempt.
 // The default deterministic policy admits at or below frac*cap minus
 // min(Hysteresis, frac*cap/2). A supplied policy determines its own rules.
 // Only the first optional weight is passed to the policy. Nonpositive or
@@ -217,6 +250,7 @@ func (l *Limiter) AwaitCapacity(ctx context.Context, frac float64, weight ...flo
 	if l.canProceed(frac, w) {
 		return nil
 	}
+	waitStarted := time.Now()
 
 	// Tiny canceller: broadcast once on ctx cancel for prompt wake.
 	cancelOnce := new(sync.Once)
@@ -239,7 +273,11 @@ func (l *Limiter) AwaitCapacity(ctx context.Context, frac float64, weight ...flo
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if l.canProceedLocked(frac, w) {
+		effectiveFrac := normalizeFrac(frac)
+		if l.cfg.Aging.Enabled {
+			effectiveFrac = agingFrac(frac, time.Since(waitStarted), l.cfg.Aging)
+		}
+		if l.canProceedLocked(effectiveFrac, w) {
 			return nil
 		}
 		l.cond.Wait()
@@ -342,11 +380,27 @@ func (l *Limiter) canProceed(frac, weight float64) bool {
 	return l.canProceedLocked(frac, weight)
 }
 
+// normalizeFrac bounds caller fractions without admitting invalid inputs freely.
+func normalizeFrac(frac float64) float64 {
+	if frac <= 0 || math.IsNaN(frac) || math.IsInf(frac, 0) {
+		return 0.000001
+	}
+	return math.Min(frac, 1)
+}
+
+// agingFrac uses a defaulted configuration and elapsed time for a single call.
+func agingFrac(frac float64, waited time.Duration, cfg AgingConfig) float64 {
+	frac = normalizeFrac(frac)
+	if !cfg.Enabled || waited <= cfg.Delay {
+		return frac
+	}
+	progress := math.Min(float64(waited-cfg.Delay)/float64(cfg.RampDuration), 1)
+	return math.Min(1, frac+cfg.MaxFracBoost*progress)
+}
+
 // canProceedLocked evaluates admission. The caller must hold l.mu.
 func (l *Limiter) canProceedLocked(frac, weight float64) bool {
-	if frac <= 0 || math.IsNaN(frac) || math.IsInf(frac, 0) {
-		frac = 0.000001
-	}
+	frac = normalizeFrac(frac)
 	if weight <= 0 || math.IsNaN(weight) || math.IsInf(weight, 0) {
 		weight = 1.0
 	}

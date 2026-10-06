@@ -386,7 +386,8 @@ func TestConfigDefaultsAndCustomSettings(t *testing.T) {
 		t.Fatalf("unexpected defaults: %+v", got)
 	}
 	custom := Config{Mode: Mode(99), GlobalFrac: .05, Window: 3 * time.Minute,
-		SampleEvery: 50 * time.Millisecond, Hysteresis: .001}
+		SampleEvery: 50 * time.Millisecond, Hysteresis: .001,
+		Aging: AgingConfig{Enabled: true, Delay: time.Second, RampDuration: time.Minute, MaxFracBoost: .2}}
 	if got := custom.withDefaults(); got != custom {
 		t.Fatalf("valid settings changed: %+v", got)
 	}
