@@ -167,10 +167,16 @@ func hashLoop(ctx context.Context, limiter *cpulimit.Limiter, frac float64, chun
 	runtime.KeepAlive(hash.Sum(nil))
 }
 
-func observePhase(ctx context.Context, p phase, counters []workerCounters, fractions []float64) (phaseResult, error) {
+func observePhase(ctx context.Context, p phase, counters []workerCounters, fractions []float64, startWork func()) (phaseResult, error) {
 	r := phaseResult{Name: p.Name, Target: p.TargetCPUs}
-	if !pause(ctx, p.Warmup) {
-		return r, nil
+	if p.Warmup > 0 {
+		if startWork != nil {
+			startWork()
+			startWork = nil
+		}
+		if !pause(ctx, p.Warmup) {
+			return r, nil
+		}
 	}
 	before := make([]workerStats, len(counters))
 	for i := range counters {
@@ -193,6 +199,11 @@ func observePhase(ctx context.Context, p phase, counters []workerCounters, fract
 	defer ticker.Stop()
 	timer := time.NewTimer(p.Measure)
 	defer timer.Stop()
+	// With no warmup, establish the independent CPU/time baseline before any
+	// controller or worker can run. Startup then belongs to the measured phase.
+	if startWork != nil {
+		startWork()
+	}
 	for {
 		finished := false
 		select {
@@ -239,9 +250,20 @@ func executeWorkload(ctx context.Context, spec workload, ready string) (workload
 		limiter = cpulimit.New(spec.Phases[0].Config, nil, policy)
 	}
 	var wg sync.WaitGroup
-	if limiter != nil {
+	begin := make(chan struct{})
+	launch := func(work func()) {
 		wg.Add(1)
-		go func() { defer wg.Done(); limiter.Run(ctx) }()
+		go func() {
+			defer wg.Done()
+			select {
+			case <-begin:
+				work()
+			case <-ctx.Done():
+			}
+		}()
+	}
+	if limiter != nil {
+		launch(func() { limiter.Run(ctx) })
 	}
 	start := time.Now()
 	var duty atomic.Uint64
@@ -250,20 +272,16 @@ func executeWorkload(ctx context.Context, spec workload, ready string) (workload
 	fractions := make([]float64, spec.Workers)
 	for i := range counters {
 		fractions[i] = spec.Fractions[i%len(spec.Fractions)]
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
+		launch(func() {
 			hashLoop(ctx, limiter, fractions[i], spec.ChunkBytes, &counters[i], &duty, start)
-		}(i)
+		})
 	}
 	if spec.Background > 0 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		launch(func() {
 			var backgroundDuty atomic.Uint64
 			backgroundDuty.Store(uint64(spec.Background * 1000))
 			hashLoop(ctx, nil, 1, spec.ChunkBytes, &workerCounters{}, &backgroundDuty, start)
-		}()
+		})
 	}
 	// Always stop and join all workers, even if observation or config setup fails.
 	defer func() { cancel(); wg.Wait() }()
@@ -287,7 +305,11 @@ func executeWorkload(ctx context.Context, spec workload, ready string) (workload
 			}
 		}
 		duty.Store(uint64(p.Duty * 1000))
-		pr, err := observePhase(ctx, p, counters, fractions)
+		var startWork func()
+		if i == 0 {
+			startWork = func() { close(begin) }
+		}
+		pr, err := observePhase(ctx, p, counters, fractions, startWork)
 		if err != nil {
 			return r, err
 		}

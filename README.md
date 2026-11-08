@@ -16,8 +16,9 @@ calls `AwaitCapacity`; it does not suspend the whole process.
 - Built-in process CPU meters for macOS, Linux, Windows, and FreeBSD.
 - Real-workload tests have run on macOS and Linux. Earlier sampling exposed
   Deterministic multi-core overshoot on both hosts. With time-weighted sampling,
-  both policies pass the short-window suite on macOS; corrected Linux behavior
-  and five-minute windows still need validation. See the
+  both policies pass the short-window suite on macOS. Earlier SingleCore
+  five-minute tests passed after warmup; the startup-inclusive long suite and
+  corrected Linux behavior still need full-duration validation. See the
   [E2E findings](e2e/README.md#validation-findings). Windows and FreeBSD runtime
   validation is still pending.
 
@@ -284,6 +285,12 @@ make build-all      # Cross-build all supported platforms
 make clean          # Remove build output (BUILD_DIR, default: build/)
 make test-e2e-smoke  # Opt-in macOS/Linux CPU workload checks
 ```
+
+All E2E Make targets automatically save full logs, structured test events,
+PASS/FAIL/SKIP diagnostics and CPU analysis under their timestamped report
+directory, plus a matching `.zip` containing the complete run. Read
+`summary.md` first, or download the archive for analysis; no separate `tee` or
+manual packing is needed. Failed tests keep a nonzero exit status.
 
 Cross-builds cover Linux, macOS (`darwin`), Windows, and FreeBSD on `amd64` and
 `arm64`. Use `make build-linux` (or `build-darwin`, `build-windows`,

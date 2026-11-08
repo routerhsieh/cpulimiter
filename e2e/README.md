@@ -14,7 +14,7 @@ From the repository root, with Go 1.22 or later:
 ```sh
 make test-e2e-smoke   # Unlimited baseline + two modes/policies; about 30 seconds
 make test-e2e         # Full short-window suite; approximately 5 minutes
-make test-e2e-long    # Also test the default five-minute window; about an hour
+make test-e2e-long    # Also test five-minute single/multi-core windows; about 2h 45m
 ```
 
 Each Make invocation creates a unique report directory under `build/e2e/`, for
@@ -23,8 +23,54 @@ by `mktemp` to prevent collisions even for runs started in the same second.
 The timestamp uses UTC, and the directory path is printed before testing starts.
 `E2E_OUTPUT` overrides the parent directory; all three E2E targets append a new
 timestamped directory. Existing reports are preserved even if a run fails.
+At exit, the Go report tool creates a matching `.zip` beside that directory,
+for example `build/e2e/20261107T214000Z-test-e2e-XXXXXX.zip`, and prints its path.
+Download that one archive to share the complete run. Packing uses Go's standard
+`archive/zip` package; no external `tar`, `gzip` or `zip` executable is required.
+The original directory is kept, and the temporary runner executable is excluded
+from the ZIP. Test failures and handled interruptions still attempt packaging
+and keep their original nonzero exit status. ZIP creation itself is portable,
+including Windows; the workload runner still supports only macOS/Linux.
+
+If packing fails, Make fails and keeps the original reports; `archive-error.log`
+records the error when writable. Temporary ZIP files are removed, and the final
+ZIP appears only after all entries are written. If the Go report tool cannot even
+build or start, bootstrap logs and an ERROR summary remain in the directory, but
+ZIP creation is unavailable. No external archive command is used as a fallback.
+No `tee` is needed: live console output and all diagnostic artifacts are captured
+automatically in that same directory. Start with `summary.md` for analysis or
+`summary.json` for machine-readable results:
+
+```text
+summary.md                 PASS/FAIL/SKIP, reasons, report links and CPU/window analysis
+summary.json               Statuses, diagnostics, exact command, platform and build metadata
+run.log                    Full test output, compiler errors and runner messages
+events.jsonl               Raw structured Go test events
+bootstrap.log              Report-runner build output
+Test*.json                 Original workload specifications and CPU/worker measurements
+Test*.attempt/spec.json    Workload saved before the subprocess starts
+Test*.attempt/child.log    Subprocess output, including crash/timeout diagnostics
+Test*.attempt/result.json  Raw subprocess result, if it produced one
+```
+
+The summary's verdict comes from Go's test events after validation; the existence
+of a metrics file alone does not imply PASS. Failed and skipped tests keep their
+diagnostics even when no metrics exist. Compiler/setup failures retain command
+diagnostics, and a failed test or report-generation error makes `make` fail.
+The temporary report-runner executable is removed automatically after the run.
+
+SIGINT/SIGTERM requests shutdown of the test process group and writes an
+`INTERRUPTED` summary; tests without a terminal event become `INCOMPLETE`.
+Snapshots are saved during execution. If forcibly killed (SIGKILL), a final
+summary cannot be guaranteed: `BOOTSTRAPPING`/`RUNNING` indicates an unfinished
+run, not success. Keep the **entire run directory** when sharing results.
+Packaging on interruption is best effort; SIGKILL cannot run cleanup or guarantee
+an archive. When available, share the automatically generated `.zip`.
+
 The default short window is one
 second, with two windows of warmup and four windows of measurement per phase.
+Long workloads have no warmup: measurement begins before the controller and
+workers are released, so startup and the first full window are included.
 The suite runs sequentially to avoid competing with its own workload processes.
 Do not run it concurrently with another workload suite or a benchmark.
 
@@ -38,6 +84,16 @@ make test-e2e E2E_ARGS='-test.run=TestE2EPriorityAndAging'
 # Without Make; absolute report paths avoid Go's package-directory working dir.
 go test -tags=e2e -count=1 -v -timeout=15m ./e2e \
   -e2e.output=/tmp/cpulimiter-e2e
+
+# Only long-window groups, including both policies and all worker/chunk cases.
+make test-e2e-long E2E_ARGS='-test.run=Window'
+
+# Only the six new multi-core cases, if SingleCore is already validated (~2h).
+make test-e2e-long E2E_ARGS='-test.run=TestE2EMulticoreLongWindow'
+
+# Harness diagnostic only: exercise all long-case configurations in ~2 minutes.
+# This override does NOT validate five-minute behavior.
+make test-e2e-long E2E_ARGS='-test.run=Window -e2e.long-window=2s'
 ```
 
 `-short` skips workloads. Do not use `-race` to assess CPU tuning: instrumentation
@@ -54,10 +110,34 @@ successful command on Windows does not establish runtime coverage there.
 | `TestE2EBurstAndIdle` | Saturation, idle, synchronized 100ms bursts, then sustained work again. |
 | `TestE2EPriorityAndAging` | Mixed fractions 0.2/0.5/0.8; uncooperative background work excludes a 0.05-fraction probe; enable aging to restore progress; disable aging to restore exclusion. A boost of 2 exercises the effective-frac cap. Both policies are tested. |
 | `TestE2EInterrupt` | SIGINT while workers/controller are running, cooperative cancellation, bounded shutdown and goroutine cleanup. |
-| `TestE2EDefaultWindow` | Opt-in five-minute history, ten-minute warmup and twenty-minute measurement per policy, using default CPU settings. |
+| `TestE2EDefaultWindow` | Both policies, SingleCore 0.7 CPU target, two workers and 256 KiB chunks, using the default five-minute window and CPU settings. |
+| `TestE2EMulticoreLongWindow` | Both policies, AllCores target above one CPU; workers equal to cores, workers above cores, and above-core workers with 4 MiB chunks. Separate unlimited calibration immediately before each case. |
 
-The primary multi-core target is `min(2.5, 0.6 * logical CPUs)`, with more workers
-than cores. On hosts where that target is at least 2 CPUs, the case must actually
+The long suite has **eight limited workloads**: four configurations per policy.
+Each uses a five-minute window and measures twenty minutes from startup, with
+**zero warmup**. Both the first complete five-minute window and subsequent
+observed rolling windows are checked.
+The three multi-core configurations use `min(2.5, 0.7 * logical CPUs)` as the target;
+workers are respectively `N`, `N+2` and `N+2`, with 256 KiB, 256 KiB and 4 MiB
+chunks. The target stays below host capacity while allowing meaningful multi-core
+usage on smaller hosts. The measured phase must actually average more than one CPU.
+
+The six multi-core cases each get a fresh unlimited baseline with matching worker
+count and chunk size, using the short-suite timing. Insufficient baseline headroom
+or a single-logical-CPU host produces an explicit skip, which is missing coverage,
+not successful multi-core validation. Filtering to one policy/case still runs its
+nested calibration. On a suitable host the complete long target takes about two
+hours and forty-five minutes, including the short suite, with a 3h30m timeout.
+
+`-e2e.long-window` defaults to five minutes. A smaller override scales the four-window
+measurement duration (warmup stays zero), prints a `DIAGNOSTIC` message, and appears
+in report configuration;
+it is for checking the harness, not certifying long-window behavior. Long-suite
+runtime/aging/burst/cancellation scenarios still use the separate short-window
+groups; these eight long cases cover sustained CPU control.
+
+The short suite's primary multi-core target is `min(2.5, 0.6 * logical CPUs)`, with
+more workers than cores. On hosts where that target is at least 2 CPUs, the case must actually
 sustain more than one CPU. Cases lacking 25% headroom in the measured unlimited
 baseline are explicitly skipped, rather than presented as successful multi-core
 validation. Single-logical-CPU hosts skip the main multi-core case. Container
@@ -74,7 +154,9 @@ properties independently.
 ## Measurements and pass criteria
 
 CPU values are in logical cores: **1 CPU = 100% of one logical core**, irrespective
-of machine size. Each phase discards its warmup before collecting measurements.
+of machine size. Short phases discard their explicit warmup; long phases start
+CPU/time observation before releasing the controller and workers, retaining
+startup work. No ten-minute period is excluded from long-window acceptance.
 
 * The observer reads cumulative `getrusage(RUSAGE_SELF)` CPU time directly on a
   separate path from the limiter's history. Both naturally use the same OS source;
@@ -83,8 +165,11 @@ of machine size. Each phase discards its warmup before collecting measurements.
   waiting for the child, including startup, warmup and shutdown. This is an
   external accounting cross-check, distinct from the steady-phase result.
 * Reports retain CPU samples for rolling-window analysis. Sample spacing is
-  `Window/10`, bounded to 10–100ms. The maximum observed rolling average is logged
-  for diagnosis, not asserted as a hard cap or used to claim an exact SLA.
+  `Window/10`, bounded to 10–100ms. Short groups log rolling maxima for diagnosis.
+  Both long-window groups also require their observed rolling averages, starting
+  with the first complete window after startup, to remain
+  within the same regression tolerance used for the whole-phase mean; this is
+  not an instantaneous cap or a proof about every continuously sliding window.
 * Worker reports include measured-phase chunks and successful admission wait
   buckets: `<1ms`, `<10ms`, `<100ms`, `<1s`, `<5s`, `<30s`, and `>=30s`. Maximum
   successful wait is cumulative across phases. Canceled waits are excluded.
@@ -104,15 +189,21 @@ On heavily contended hosts, a failed utilization or background-load assumption
 may indicate an unsuitable test environment. CPU limits are cooperative, so
 instantaneous spikes and some short-window overshoot are expected.
 
-Each JSON artifact contains the complete workload specification, phase samples,
-worker statistics, platform/toolchain metadata and external CPU accounting. Use
-`go test -json` if machine-readable test pass/fail/skip status is also needed;
-skipped scenarios do not have workload artifacts. The Make targets isolate each
+Each workload JSON contains the complete specification, phase samples,
+worker statistics, platform/toolchain metadata and external CPU accounting.
+The Make runner adds test verdicts and diagnostic analysis in `summary.json` and
+`summary.md`; counts include test groups as well as individual tests. Skipped
+scenarios have summary entries even though they have no workload measurements.
+The runner also warns if only calibration or utility tests ran without any
+limited-workload reports. A successful run with skips is not complete coverage.
+The Make targets isolate each
 run in its own directory. Direct `go test` invocations do not add a timestamp:
 reusing `-e2e.output` directly replaces matching report names and can leave stale
 reports from other scenarios. Do not infer Linux validation
 from a macOS run or from cross-compilation. This is a representative regression
 matrix, not exhaustive coverage of all scheduler interleavings or workloads.
+Direct `go test` also bypasses the automatic run summary and console-log capture;
+use the Make targets for a complete diagnostic bundle.
 
 ## Validation findings
 
@@ -216,4 +307,32 @@ can exceed the mean-usage threshold; the correction is not a strict quota.
 This verifies the correction on the tested Mac workload, not a hard CPU ceiling.
 Boundary prorating assumes uniform usage within an observation interval; finer
 CPU timing is unavailable during missing reads. Linux execution of the corrected
-code and the optional five-minute-window runs remain to be performed.
+code still needs validation.
+
+### First five-minute-window run and expanded coverage
+
+The supplied macOS long-run log `e2e-long-20261108-001218.log` completed the original
+short suite and two SingleCore long cases in approximately 64 minutes 21 seconds,
+with all workloads passing. With two workers and a 0.7 CPU target, the measured
+twenty-minute means were 0.68008 CPU for Deterministic and 0.56423 CPU for PowerCurve.
+The observed five-minute rolling maxima were 0.68072 and 0.56525 CPU respectively.
+
+That run did **not** cover multi-core five-minute windows. The long suite has now
+been expanded to the eight limited workloads described above, with separate
+calibration and observed rolling-window assertions. The six new multi-core
+five-minute cases have not yet been run at their full duration. Shortened
+`-e2e.long-window` diagnostics do not change that validation status.
+
+Before removing warmup, the expanded matrix was exercised on the Mac with
+`-e2e.long-window=2s`: all eight
+limited workloads and six calibration processes passed in approximately 133
+seconds. All six multi-core workloads sustained more than one CPU and passed both
+whole-phase and observed rolling-window checks. This is a harness diagnostic,
+not completion of the new five-minute multi-core validation.
+
+After removing long-case warmup and establishing observation before releasing the
+controller and workers, the same eight limited cases and six calibrations passed
+the two-second diagnostic again in approximately 101 seconds. Each limited report
+has `Warmup: 0`, with startup included in its eight-second measurement. A unit test
+also verifies startup work is counted. Full-duration startup-inclusive five-minute
+results remain pending; the earlier warmed-up run is not evidence for that scope.

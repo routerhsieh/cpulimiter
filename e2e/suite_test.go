@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -20,10 +21,11 @@ import (
 )
 
 var (
-	smoke   = flag.Bool("e2e.smoke", false, "run a small CPU matrix only")
-	longRun = flag.Bool("e2e.long", false, "also run both policies with the default five-minute window")
-	window  = flag.Duration("e2e.window", time.Second, "short-suite averaging window (at least 500ms)")
-	output  = flag.String("e2e.output", "", "directory for workload specifications and JSON measurements")
+	smoke      = flag.Bool("e2e.smoke", false, "run a small CPU matrix only")
+	longRun    = flag.Bool("e2e.long", false, "also run single-core and multi-core long-window cases for both policies")
+	longWindow = flag.Duration("e2e.long-window", 5*time.Minute, "long-suite window; override only for shorter harness diagnostics")
+	window     = flag.Duration("e2e.window", time.Second, "short-suite averaging window (at least 500ms)")
+	output     = flag.String("e2e.output", "", "directory for workload specifications and JSON measurements")
 )
 
 func config(mode cpulimit.Mode, cpus float64, w time.Duration) cpulimit.Config {
@@ -40,6 +42,12 @@ func measuredPhase(name string, cfg cpulimit.Config, cpus float64) phase {
 	return phase{Name: name, Config: cfg, TargetCPUs: cpus, Warmup: 2 * cfg.Window, Measure: 4 * cfg.Window, Duty: 1}
 }
 
+// Long workloads measure startup and all subsequent complete windows, rather
+// than excluding an initial warmup. Four windows give twenty minutes by default.
+func longPhase(name string, cfg cpulimit.Config, cpus float64) phase {
+	return phase{Name: name, Config: cfg, TargetCPUs: cpus, Measure: 4 * cfg.Window, Duty: 1}
+}
+
 func baseWorkload(name, policy string, workers int, phases ...phase) workload {
 	return workload{Name: name, Policy: policy, Workers: workers, Fractions: []float64{1}, ChunkBytes: 256 * 1024, Phases: phases}
 }
@@ -48,6 +56,9 @@ func checkEnvironment(t *testing.T) {
 	t.Helper()
 	if *window < 500*time.Millisecond {
 		t.Fatal("e2e.window must be at least 500ms; shorter windows make CPU assertions unreliable")
+	}
+	if *longRun && *longWindow < 500*time.Millisecond {
+		t.Fatal("e2e.long-window must be at least 500ms")
 	}
 	if testing.Short() {
 		t.Skip("real CPU workloads disabled by -short")
@@ -65,6 +76,22 @@ func runProcess(t *testing.T, spec workload, interruptAfter time.Duration) workl
 	if err := os.WriteFile(specPath, data, 0600); err != nil {
 		t.Fatal(err)
 	}
+	// Persist the attempted workload before launch, including cases that fail
+	// before producing their final metrics. Do not rely on t.TempDir surviving.
+	attempt := ""
+	if *output != "" {
+		name := strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())
+		attempt = filepath.Join(*output, name+".attempt")
+		if err := os.MkdirAll(attempt, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(attempt, "spec.json"), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		// Let the child write directly into the durable bundle, including when
+		// interruption prevents this test process from running deferred cleanup.
+		resultPath = filepath.Join(attempt, "result.json")
+	}
 	timeout := 15 * time.Second
 	for _, p := range spec.Phases {
 		timeout += p.Warmup + p.Measure
@@ -75,12 +102,32 @@ func runProcess(t *testing.T, spec workload, interruptAfter time.Duration) workl
 	cmd.Env = append(os.Environ(), "CPULIMITER_E2E_SPEC="+specPath, "CPULIMITER_E2E_RESULT="+resultPath, "CPULIMITER_E2E_READY="+readyPath)
 	var log bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &log, &log
+	if attempt != "" {
+		childLog, err := os.Create(filepath.Join(attempt, "child.log"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := childLog.Close(); err != nil {
+				t.Errorf("close child log: %v", err)
+			}
+		}()
+		writer := io.MultiWriter(childLog, &log)
+		cmd.Stdout, cmd.Stderr = writer, writer
+	}
 	started := time.Now()
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
+	waited := false
+	defer func() {
+		cancel()
+		if !waited {
+			<-done
+		}
+	}()
 	if interruptAfter > 0 {
 		// Wait for workers/controller to exist, then let CPU history accumulate
 		// before sending the same signal as Ctrl+C.
@@ -90,6 +137,7 @@ func runProcess(t *testing.T, spec workload, interruptAfter time.Duration) workl
 			}
 			select {
 			case err := <-done:
+				waited = true
 				t.Fatalf("workload exited before readiness: %v\n%s", err, log.String())
 			case <-ctx.Done():
 				t.Fatal("timed out waiting for workload readiness")
@@ -103,7 +151,9 @@ func runProcess(t *testing.T, spec workload, interruptAfter time.Duration) workl
 			t.Fatal(err)
 		}
 	}
-	if err := <-done; err != nil {
+	cmdErr := <-done
+	waited = true
+	if err := cmdErr; err != nil {
 		t.Fatalf("workload %s failed (timeout=%v): %v\n%s", spec.Name, ctx.Err(), err, log.String())
 	}
 	wall := time.Since(started)
@@ -385,17 +435,96 @@ func TestE2EInterrupt(t *testing.T) {
 func TestE2EDefaultWindow(t *testing.T) {
 	checkEnvironment(t)
 	if !*longRun || *smoke {
-		t.Skip("requires -e2e.long; approximately one hour for both policies")
+		t.Skip("requires -e2e.long; default-window cases take forty minutes for both policies")
 	}
+	logLongWindow(t)
 	for _, policy := range []string{"deterministic", "power"} {
 		t.Run(policy, func(t *testing.T) {
 			// Explicit equivalent of the library defaults, so SetConfig equality
 			// and the report include the actual settings instead of zero values.
-			cfg := cpulimit.Config{GlobalFrac: .7, Window: 5 * time.Minute, SampleEvery: 100 * time.Millisecond, Hysteresis: .02,
+			cfg := cpulimit.Config{GlobalFrac: .7, Window: *longWindow, SampleEvery: 100 * time.Millisecond, Hysteresis: .02,
 				Aging: cpulimit.AgingConfig{RampDuration: 30 * time.Second, MaxFracBoost: .1}}
-			p := measuredPhase("default_window", cfg, .7)
+			p := longPhase("default_window", cfg, .7)
 			r := runProcess(t, baseWorkload("default_window", policy, 2, p), 0)
-			validatePhase(t, p, r.Phases[0], .7*.35, true)
+			validateLongPhase(t, p, r.Phases[0])
 		})
+	}
+}
+
+func logLongWindow(t *testing.T) {
+	t.Helper()
+	if *longWindow != 5*time.Minute {
+		t.Logf("DIAGNOSTIC: long-window override=%s; this does not validate the five-minute window", *longWindow)
+	}
+}
+
+// Check the observed rolling windows as well as the entire measured phase.
+// Bounds remain regression tolerances, not an instantaneous quota or exact SLA.
+func validateLongPhase(t *testing.T, p phase, r phaseResult) {
+	t.Helper()
+	validatePhase(t, p, r, p.TargetCPUs*.35, true)
+	if len(r.Samples) < 2 || r.Samples[len(r.Samples)-1].Elapsed < p.Config.Window {
+		t.Fatal("long-window case did not observe a complete rolling window")
+	}
+	peak := rollingMaximum(r.Samples, p.Config.Window)
+	upper := p.TargetCPUs*1.35 + .06
+	if peak > upper {
+		t.Errorf("phase %s: observed rolling mean %.3f CPUs above tolerance %.3f", p.Name, peak, upper)
+	}
+}
+
+func TestE2EMulticoreLongWindow(t *testing.T) {
+	checkEnvironment(t)
+	if !*longRun || *smoke {
+		t.Skip("requires -e2e.long; multi-core cases take two hours for both policies")
+	}
+	logLongWindow(t)
+	n := runtime.NumCPU()
+	if n < 2 {
+		t.Skip("multi-core long-window coverage requires at least two logical CPUs")
+	}
+	// Leave calibration headroom on small hosts while still targeting >1 CPU.
+	target := math.Min(2.5, float64(n)*.7)
+	type multicoreCase struct {
+		name           string
+		workers, chunk int
+	}
+	cases := []multicoreCase{
+		{"workers_equal_cores", n, 256 * 1024},
+		{"workers_above_cores", n + 2, 256 * 1024},
+		{"long_chunks", n + 2, 4 * 1024 * 1024},
+	}
+	for _, policy := range []string{"deterministic", "power"} {
+		for _, tc := range cases {
+			t.Run(policy+"/"+tc.name, func(t *testing.T) {
+				// Calibrate the same worker count/chunk size immediately before
+				// each long case, so narrow test filters still include calibration.
+				var available float64
+				if !t.Run("calibration", func(t *testing.T) {
+					p := measuredPhase("unlimited", config(cpulimit.AllCores, target, *window), 0)
+					spec := baseWorkload("long_window_calibration", policy, tc.workers, p)
+					spec.Unlimited, spec.ChunkBytes = true, tc.chunk
+					r := runProcess(t, spec, 0)
+					validatePhase(t, p, r.Phases[0], .1, false)
+					available = float64(r.Phases[0].CPU) / float64(r.Phases[0].Wall)
+				}) {
+					return
+				}
+				if available == 0 {
+					t.Fatal("calibration was excluded by test filter")
+				}
+				if available < target*1.25 {
+					t.Skipf("unlimited baseline %.2f CPUs lacks headroom for %.2f CPU target; multi-core case not validated", available, target)
+				}
+				p := longPhase(tc.name, config(cpulimit.AllCores, target, *longWindow), target)
+				spec := baseWorkload("multicore_long_window_"+tc.name, policy, tc.workers, p)
+				spec.ChunkBytes = tc.chunk
+				r := runProcess(t, spec, 0)
+				validateLongPhase(t, p, r.Phases[0])
+				if float64(r.Phases[0].CPU)/float64(r.Phases[0].Wall) <= 1 {
+					t.Error("multi-core long-window case did not sustain more than one CPU")
+				}
+			})
+		}
 	}
 }
