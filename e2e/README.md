@@ -17,6 +17,19 @@ make test-e2e         # Full short-window suite; approximately 5 minutes
 make test-e2e-long    # Also test five-minute single/multi-core windows; about 2h 45m
 ```
 
+On macOS, prevent idle system sleep when measuring continuous operation:
+
+```sh
+caffeinate -i make test-e2e-long
+```
+
+Display sleep alone does not stop the workload. System sleep pauses execution,
+and Go's monotonic clock on this macOS host excludes that time. A sleep-interrupted
+run can therefore take much longer in calendar time while still passing its
+measured-duration checks; record it separately from an uninterrupted run.
+`caffeinate -i` prevents idle sleep, but does not guarantee protection against
+manual sleep or closing the lid.
+
 Each Make invocation creates a unique report directory under `build/e2e/`, for
 example `build/e2e/20261107T214000Z-test-e2e-XXXXXX/`. The actual suffix is generated
 by `mktemp` to prevent collisions even for runs started in the same second.
@@ -208,8 +221,10 @@ use the Make targets for a complete diagnostic bundle.
 ## Validation findings
 
 The macOS and Linux findings immediately below describe the earlier count-based
-sampling implementation. See the sampling correction follow-up for the current
-implementation's validation results.
+sampling implementation. The sampling correction and full startup-inclusive
+long-window results below describe the current implementation. Both policies
+passed the latest suites on both hosts; the macOS long run was interrupted by
+system sleep and does not establish uninterrupted long-run behavior.
 
 ### macOS
 
@@ -265,15 +280,15 @@ without aging, only the 0.8-fraction worker progressed during measurement; the
 cleanup checks passed across the run. The five-minute-window test was skipped;
 the subprocess entry-point test's skip in the parent run is expected.
 
-### Interpretation
+### Interpretation of the original failures
 
-These observations require investigation of the limiter's behavior under high
+These observations prompted investigation of the limiter's behavior under high
 concurrency. Reproduction on both hosts shows that the observed failure is not
 limited to macOS; these reports alone do not identify its root cause. The suite
 retains the failing assertions; they are not skipped as
 known failures or used to widen acceptance bounds. A passing smoke run is not a
-claim that the full suite or tighter CPU accuracy requirements pass. No limiter
-production code is changed by this E2E addition.
+claim that the full suite or tighter CPU accuracy requirements pass. The sampling
+correction and subsequent validation are documented below.
 
 ### Sampling correction follow-up
 
@@ -306,8 +321,8 @@ can exceed the mean-usage threshold; the correction is not a strict quota.
 
 This verifies the correction on the tested Mac workload, not a hard CPU ceiling.
 Boundary prorating assumes uniform usage within an observation interval; finer
-CPU timing is unavailable during missing reads. Linux execution of the corrected
-code still needs validation.
+CPU timing is unavailable during missing reads. The subsequent Linux validation
+is recorded in the full-duration results below.
 
 ### First five-minute-window run and expanded coverage
 
@@ -317,11 +332,11 @@ with all workloads passing. With two workers and a 0.7 CPU target, the measured
 twenty-minute means were 0.68008 CPU for Deterministic and 0.56423 CPU for PowerCurve.
 The observed five-minute rolling maxima were 0.68072 and 0.56525 CPU respectively.
 
-That run did **not** cover multi-core five-minute windows. The long suite has now
+That run did **not** cover multi-core five-minute windows. The long suite was then
 been expanded to the eight limited workloads described above, with separate
-calibration and observed rolling-window assertions. The six new multi-core
-five-minute cases have not yet been run at their full duration. Shortened
-`-e2e.long-window` diagnostics do not change that validation status.
+calibration and observed rolling-window assertions. The shortened
+`-e2e.long-window` diagnostics below verified the harness before the full-duration
+runs reported in the next section.
 
 Before removing warmup, the expanded matrix was exercised on the Mac with
 `-e2e.long-window=2s`: all eight
@@ -334,5 +349,51 @@ After removing long-case warmup and establishing observation before releasing th
 controller and workers, the same eight limited cases and six calibrations passed
 the two-second diagnostic again in approximately 101 seconds. Each limited report
 has `Warmup: 0`, with startup included in its eight-second measurement. A unit test
-also verifies startup work is counted. Full-duration startup-inclusive five-minute
-results remain pending; the earlier warmed-up run is not evidence for that scope.
+also verifies startup work is counted. The earlier warmed-up run is not evidence
+for startup-inclusive behavior; the following runs exercise that scope.
+
+### Full startup-inclusive long-window results (2026-11-08)
+
+Both supplied `make test-e2e-long` runs completed with status PASS, exit code zero,
+53 passing test entries and one expected skip (`TestWorkloadProcess`, the child
+entry point). Counts include parent groups and observer tests. Each archive
+contains 41 workload reports: 34 limited workloads and seven unlimited
+calibrations. No workload was skipped for insufficient resources. Both policies
+passed the short suite, runtime updates, burst/idle recovery, mixed priority,
+aging recovery, cancellation and goroutine cleanup checks.
+
+| Host | Report archive | Environment | Duration |
+| --- | --- | --- | --- |
+| Linux | `20261108T112247Z-test-e2e-long-G3aatX.zip` | amd64, Go 1.22.2, 12 logical CPUs, GOMAXPROCS=12 | Approximately 2h 45m, without an observed sleep interruption |
+| macOS | `20261108T111050Z-test-e2e-long-RCv82A.zip` | arm64, Go 1.26.6, 14 logical CPUs, GOMAXPROCS=14 | Approximately 2h 45m of Go elapsed time, but 10h 3m of calendar time, interrupted by system sleep |
+
+The archives record VCS revisions `35d6296e80da6971ff95efadba0fbf47660838ea`
+(Linux) and `ce65b9fdf0e9214e2367f2f089a245287ab28cab` (macOS), both with
+`vcs.modified=true`; these are recorded working-tree runs rather than pristine
+commit reproductions.
+
+All eight long workloads per host used a 300-second window, **zero warmup** and
+1,200 seconds of measurement starting before controller/worker release. Each
+reported complete measurement and worker progress. In the table, each value is
+the twenty-minute mean / maximum observed five-minute rolling average, in CPUs.
+`N` is the host's logical CPU count.
+
+| Long workload | Target | Linux Deterministic | Linux PowerCurve | macOS Deterministic | macOS PowerCurve |
+| --- | --- | --- | --- | --- | --- |
+| SingleCore, 2 workers, 256 KiB | 0.7 | 0.67983 / 0.68067 | 0.56472 / 0.56647 | 0.68008 / 0.68072 | 0.56425 / 0.56536 |
+| AllCores, N workers, 256 KiB | 2.5 | 2.42540 / 2.42701 | 2.11583 / 2.11707 | 2.42544 / 2.42946 | 2.12537 / 2.12860 |
+| AllCores, N+2 workers, 256 KiB | 2.5 | 2.42526 / 2.42699 | 2.12619 / 2.12745 | 2.42566 / 2.43008 | 2.13273 / 2.13549 |
+| AllCores, N+2 workers, 4 MiB | 2.5 | 2.42531 / 2.42765 | 2.28321 / 2.28567 | 2.42593 / 2.43013 | 2.26367 / 2.26577 |
+
+Every first complete five-minute window and maximum observed rolling average
+was below its actual CPU target, not merely below the broader regression
+threshold. These are sampled observations for these workloads, not proof of a
+hard ceiling over every continuously sliding window. Short-window tests still
+allow temporary overshoot as described above.
+
+Linux now has full-duration validation of the corrected sampler, including
+startup and all six multi-core long cases. macOS passed the same checks across
+sleep interruptions, but its measured intervals exclude sleep; an uninterrupted
+macOS long run remains to be performed with sleep prevented. The macOS result
+provides suspend/resume coverage for this run, rather than continuous-load
+validation. Windows and FreeBSD runtime validation remains pending.

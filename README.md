@@ -16,9 +16,10 @@ calls `AwaitCapacity`; it does not suspend the whole process.
 - Built-in process CPU meters for macOS, Linux, Windows, and FreeBSD.
 - Real-workload tests have run on macOS and Linux. Earlier sampling exposed
   Deterministic multi-core overshoot on both hosts. With time-weighted sampling,
-  both policies pass the short-window suite on macOS. Earlier SingleCore
-  five-minute tests passed after warmup; the startup-inclusive long suite and
-  corrected Linux behavior still need full-duration validation. See the
+  both policies pass the short-window and startup-inclusive five-minute-window
+  suites on both hosts. The Linux long run completed continuously; the macOS
+  long run was interrupted by system sleep, so uninterrupted macOS long-run
+  validation remains pending. See the
   [E2E findings](e2e/README.md#validation-findings). Windows and FreeBSD runtime
   validation is still pending.
 
