@@ -236,8 +236,8 @@ after a sampling wakeup. Cancellation remains the limiter's responsibility.
 The [initial macOS validation report](docs/benchmark-results.md) records real
 hashing workloads, independent CLI CPU measurements, and reproduction commands.
 It demonstrates sustained throttling and clean shutdown for the tested
-configurations, not all workloads or platforms. Automated E2E tests remain
-future work.
+configurations, not all workloads or platforms. Opt-in macOS/Linux CPU workload
+tests are available in [e2e/](e2e/README.md).
 
 Run the unit tests and race checks with:
 
@@ -256,6 +256,7 @@ make test           # Unit tests on the current platform
 make test-race      # Race checks; requires CGO and a C compiler
 make build-all      # Cross-build all supported platforms
 make clean          # Remove build output (BUILD_DIR, default: build/)
+make test-e2e-smoke  # Opt-in macOS/Linux CPU workload checks
 ```
 
 Cross-builds cover Linux, macOS (`darwin`), Windows, and FreeBSD on `amd64` and
