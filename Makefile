@@ -4,7 +4,7 @@ GO ?= go
 BUILD_DIR ?= build
 ARCHES ?= amd64 arm64
 E2E_ARGS ?=
-E2E_OUTPUT ?= $(abspath $(BUILD_DIR)/e2e)
+E2E_OUTPUT ?= $(BUILD_DIR)/e2e
 
 .PHONY: help build build-all build-linux build-darwin build-windows build-freebsd test test-race test-e2e test-e2e-smoke test-e2e-long clean
 
@@ -20,6 +20,7 @@ help:
 	@echo "make clean          Remove the build output directory (BUILD_DIR)"
 	@echo "Options: GO=go BUILD_DIR=build ARCHES='amd64 arm64'"
 	@echo "E2E options: E2E_ARGS='' E2E_OUTPUT=$(E2E_OUTPUT)"
+	@echo "Each E2E run creates a unique timestamped subdirectory under E2E_OUTPUT"
 
 build:
 	$(GO) build ./...
@@ -44,14 +45,22 @@ test:
 test-race:
 	$(GO) test -race ./...
 
-test-e2e:
-	$(GO) test -tags=e2e -count=1 -v -timeout=15m ./e2e -e2e.output="$(E2E_OUTPUT)" $(E2E_ARGS)
+test-e2e: E2E_TIMEOUT = 15m
+test-e2e: E2E_MODE =
 
-test-e2e-smoke:
-	$(GO) test -tags=e2e -count=1 -v -timeout=5m ./e2e -e2e.smoke -e2e.output="$(E2E_OUTPUT)" $(E2E_ARGS)
+test-e2e-smoke: E2E_TIMEOUT = 5m
+test-e2e-smoke: E2E_MODE = -e2e.smoke
 
-test-e2e-long:
-	$(GO) test -tags=e2e -count=1 -v -timeout=75m ./e2e -e2e.long -e2e.output="$(E2E_OUTPUT)" $(E2E_ARGS)
+test-e2e-long: E2E_TIMEOUT = 75m
+test-e2e-long: E2E_MODE = -e2e.long
+
+test-e2e test-e2e-smoke test-e2e-long:
+	@set -e; \
+		mkdir -p "$(E2E_OUTPUT)"; \
+		e2e_output_dir=$$(cd "$(E2E_OUTPUT)" && pwd -P); \
+		e2e_run_dir=$$(mktemp -d "$$e2e_output_dir/$$(date -u +%Y%m%dT%H%M%SZ)-$@-XXXXXX"); \
+		echo "E2E reports: $$e2e_run_dir"; \
+		$(GO) test -tags=e2e -count=1 -v -timeout=$(E2E_TIMEOUT) ./e2e $(E2E_MODE) -e2e.output="$$e2e_run_dir" $(E2E_ARGS)
 
 clean:
 	rm -rf -- "$(BUILD_DIR)"

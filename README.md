@@ -14,8 +14,10 @@ calls `AwaitCapacity`; it does not suspend the whole process.
 - Minimum compatible Go version: **1.22**. A currently supported Go toolchain
   is recommended.
 - Built-in process CPU meters for macOS, Linux, Windows, and FreeBSD.
-- Real-workload throttling has been validated on macOS. Linux, Windows, and
-  FreeBSD runtime validation is still pending.
+- Real-workload tests have run on macOS and Linux. PowerCurve passed the tested
+  short-window scenarios; Deterministic exceeded CPU targets in three multi-core
+  scenarios on both hosts. See the [E2E findings](e2e/README.md#validation-findings).
+  Windows and FreeBSD runtime validation is still pending.
 
 Once the repository is published, install it with:
 
