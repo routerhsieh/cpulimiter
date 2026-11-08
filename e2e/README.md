@@ -116,6 +116,10 @@ matrix, not exhaustive coverage of all scheduler interleavings or workloads.
 
 ## Validation findings
 
+The macOS and Linux findings immediately below describe the earlier count-based
+sampling implementation. See the sampling correction follow-up for the current
+implementation's validation results.
+
 ### macOS
 
 On the initial 14-logical-CPU Apple Silicon host, the 500ms-window matrix exposed
@@ -179,3 +183,37 @@ retains the failing assertions; they are not skipped as
 known failures or used to widen acceptance bounds. A passing smoke run is not a
 claim that the full suite or tighter CPU accuracy requirements pass. No limiter
 production code is changed by this E2E addition.
+
+### Sampling correction follow-up
+
+The limiter now timestamps actual CPU reads and averages CPU/wall intervals by
+elapsed time. It prorates the oldest interval at the real-time window boundary;
+changing cadence no longer changes historical weights or the retained duration.
+Both admission policies, the core-dependent cadence and all E2E thresholds are
+unchanged. The old `MovingAvg` interface and count-based `RingAvg` implementation
+have been removed; `movingavg` now provides only the elapsed-time `TimeWindow`.
+
+On the same 14-logical-CPU macOS arm64 host with Go 1.26.6, the full one-second
+short-window suite passed after this correction (approximately 261 seconds).
+The formerly failing Deterministic scenarios improved as follows:
+
+| Scenario, 2.5 CPU target | Earlier mean, CPUs | Corrected mean, CPUs |
+| --- | --- | --- |
+| 16 workers, 256 KiB chunks | 4.48 | 2.579 |
+| 14 workers, 256 KiB chunks | 4.23 | 2.637 |
+| 16 workers, 4 MiB chunks | 5.37 | 2.508 |
+
+PowerCurve passed as well, with corresponding means of 2.141, 2.130 and 2.265 CPUs.
+Runtime updates, burst/idle recovery, mixed priority, aging recovery and SIGINT
+cleanup also passed. UT and race checks cover unequal intervals, missing reads,
+counter resets, window resizing, fractional boundaries and delayed meter reads.
+
+The three Deterministic cases were also rerun with the original 500ms window and
+passed unchanged mean-usage thresholds: approximately 3.02, 2.85 and 3.09 CPUs
+respectively. They still overshoot the 2.5 CPU target, and observed rolling maxima
+can exceed the mean-usage threshold; the correction is not a strict quota.
+
+This verifies the correction on the tested Mac workload, not a hard CPU ceiling.
+Boundary prorating assumes uniform usage within an observation interval; finer
+CPU timing is unavailable during missing reads. Linux execution of the corrected
+code and the optional five-minute-window runs remain to be performed.

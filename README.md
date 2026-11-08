@@ -14,10 +14,12 @@ calls `AwaitCapacity`; it does not suspend the whole process.
 - Minimum compatible Go version: **1.22**. A currently supported Go toolchain
   is recommended.
 - Built-in process CPU meters for macOS, Linux, Windows, and FreeBSD.
-- Real-workload tests have run on macOS and Linux. PowerCurve passed the tested
-  short-window scenarios; Deterministic exceeded CPU targets in three multi-core
-  scenarios on both hosts. See the [E2E findings](e2e/README.md#validation-findings).
-  Windows and FreeBSD runtime validation is still pending.
+- Real-workload tests have run on macOS and Linux. Earlier sampling exposed
+  Deterministic multi-core overshoot on both hosts. With time-weighted sampling,
+  both policies pass the short-window suite on macOS; corrected Linux behavior
+  and five-minute windows still need validation. See the
+  [E2E findings](e2e/README.md#validation-findings). Windows and FreeBSD runtime
+  validation is still pending.
 
 Once the repository is published, install it with:
 
@@ -93,7 +95,7 @@ logical CPU. `GlobalFrac` is a fraction, not a percentage.
 | --- | --- | --- |
 | `Mode` | `SingleCore` | Reference capacity for the target and sampling cadence. |
 | `GlobalFrac` | `0.70` | Fraction of the reference capacity allowed to the process. |
-| `Window` | `5 * time.Minute` | Approximate history window for the sample average. |
+| `Window` | `5 * time.Minute` | Elapsed-time window for the CPU average. |
 | `SampleEvery` | `100 * time.Millisecond` | Base CPU sampling interval. |
 | `Hysteresis` | `0.02` | Admission margin in CPU units, not a fraction of the target. |
 | `Aging.Enabled` | `false` | Temporarily relax admission for blocked calls. |
@@ -106,10 +108,30 @@ logical CPU. `GlobalFrac` is a fraction, not a percentage.
 logical CPU count. For example, `GlobalFrac: 0.05` allows 5% of one core in
 SingleCore mode, or 5% of combined logical CPU capacity in AllCores mode.
 
-The ring buffer stores `ceil(Window / effective sampling interval)` equally
-weighted samples. This approximates a time window; delayed samples, failed
-meter reads, and sampling-cadence changes affect its actual time coverage.
-AllCores mode increases sampling overhead and history capacity on larger hosts.
+The limiter pairs each successful CPU counter read with its actual read time.
+Ticker deadlines only trigger reads; they are not measurement timestamps.
+History stores consecutive CPU/wall intervals and computes total CPU time divided
+by total elapsed time within `Window`, rather than equally weighting CPU-rate
+samples. The oldest interval is prorated at the window boundary, assuming CPU
+consumption was uniform within that interval. Startup uses only observed time.
+
+Failed or negative reads preserve the last valid baseline and average; the next
+valid reading covers the entire gap. If that gap spans the window, its average
+rate is used for the retained portion because finer timing is unavailable.
+The limiter does not assume idle time during missing measurements. A decreasing
+CPU counter clears history and establishes a new baseline. Until a new interval
+is measured, its average is zero.
+
+History storage grows with retained observations instead of preallocating a
+nominal sample count. AllCores mode can increase sampling overhead and memory
+use on larger hosts. Cooperative work and observation delays still allow spikes;
+proportional boundary estimates do not provide an exact rolling-window SLA.
+
+The `movingavg.TimeWindow` utility also accepts its zero value. Nonpositive
+constructor windows use five minutes; nonpositive resize requests preserve the
+current window. Invalid intervals (negative CPU or nonpositive wall time) are
+ignored without clearing history, rather than panicking or inventing idle time.
+Limiter configuration still applies its documented defaults before resizing.
 
 Nonpositive numeric settings above, except `Aging.Delay`, use their defaults; NaN and infinity also default
 for floating-point settings. In particular, `Hysteresis: 0` selects the default
@@ -161,10 +183,12 @@ priority thresholds is essential.
 asynchronously; the newest pending update replaces an older pending update.
 `GetConfig` returns the applied configuration, not necessarily a pending one.
 
-When the window or effective sampling interval changes, the limiter resizes its
-history, preserving the newest samples that fit. Other updates also retain
-history. Changing cadence does not reweight existing samples or recover samples
-already discarded.
+Shrinking `Window` discards elapsed history beyond the new boundary and prorates
+the oldest retained interval. Growing it preserves available history without
+adding fictitious idle time or recovering discarded observations. Changing
+sampling cadence or CPU mode does not change historical weights or duration.
+Config updates use the latest measured history; they do not extrapolate CPU
+usage from the last read to the config-update time.
 Aging updates take effect on the next admission attempt using the original wait
 start, including time spent waiting while aging was disabled. Disabling aging
 removes the boost on the next attempt.

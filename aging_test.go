@@ -86,9 +86,11 @@ func TestOriginalFracCappedForBothPolicies(t *testing.T) {
 // Keep process load stable while Run supplies real periodic wakeups.
 type agingFixedAvg struct{ value float64 }
 
-func (*agingFixedAvg) Add(float64)    {}
-func (a *agingFixedAvg) Avg() float64 { return a.value }
-func (*agingFixedAvg) Resize(int)     {}
+func (*agingFixedAvg) Add(time.Duration, time.Duration) {}
+func (a *agingFixedAvg) Avg() float64                   { return a.value }
+func (*agingFixedAvg) Resize(time.Duration)             {}
+
+func (*agingFixedAvg) Reset() {}
 
 type agingObservedPolicy struct {
 	inner  AdmissionPolicy

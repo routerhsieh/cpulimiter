@@ -19,15 +19,13 @@ const (
 	AllCores               // cap against NumCPU() CPUs; sample NumCPU() times more often
 )
 
-// MovingAvg averages the most recent samples with equal weight.
-// The limiter serializes all calls; implementations need not be thread-safe.
-type MovingAvg interface {
-	// Add inserts one observation.
-	Add(v float64)
-	// Avg returns the current average (0 if empty).
+// cpuAverage stores consecutive measured CPU/wall intervals under l.mu.
+// It is an internal contract, not an externally configurable averaging policy.
+type cpuAverage interface {
+	Add(cpu, wall time.Duration)
 	Avg() float64
-	// Resize changes capacity, preserving the newest samples that fit.
-	Resize(n int)
+	Resize(window time.Duration)
+	Reset()
 }
 
 // AdmissionPolicy decides whether a single attempt may proceed. The selected
@@ -75,8 +73,8 @@ type Config struct {
 	// Cap model
 	Mode       Mode
 	GlobalFrac float64 // e.g., 0.70 (must be >0)
-	// Window determines sample capacity as ceil(Window / effective interval).
-	// Actual time coverage varies with delays, failed reads, and cadence changes.
+	// Window bounds retained elapsed measurement time. Boundary intervals are
+	// prorated assuming uniform consumption within each measured interval.
 	Window time.Duration
 	// SampleEvery is the base sampling interval. AllCores divides it by the
 	// logical CPU count; other modes use it unchanged. The effective interval
@@ -133,7 +131,7 @@ type Limiter struct {
 
 	// Process meter and internally constructed sample average.
 	meter  UsageMeter
-	avg    MovingAvg       // NOT assumed thread-safe; always used under l.mu
+	avg    cpuAverage      // NOT assumed thread-safe; always used under l.mu
 	policy AdmissionPolicy // Fixed for this instance; called under l.mu.
 
 	// derived state (guarded by mu)
@@ -143,21 +141,6 @@ type Limiter struct {
 	// sampling state (owned by Run goroutine)
 	lastCPU time.Duration
 	lastAt  time.Time
-}
-
-// sampleCapacity rounds up so nominal history coverage is at least window.
-func sampleCapacity(window, sampleEvery time.Duration) int {
-	if window <= 0 || sampleEvery <= 0 {
-		panic("cpulimit: window and sample interval must be positive")
-	}
-	n := window / sampleEvery
-	if window%sampleEvery != 0 {
-		n++
-	}
-	if int(n) <= 0 || time.Duration(int(n)) != n {
-		panic("cpulimit: sample capacity exceeds int range")
-	}
-	return int(n)
 }
 
 // samplingInterval returns the effective cadence for a defaulted config.
@@ -172,7 +155,7 @@ func samplingInterval(cfg Config) time.Duration {
 	return interval
 }
 
-// New constructs a limiter with an initially empty ring average and applies
+// New constructs a limiter with an initially empty time-weighted average and applies
 // Config defaults. A nil meter uses the OS meter; a nil policy uses
 // admission.Deterministic. Start Run once to sample CPU. To change admission
 // behavior at runtime, update the supplied policy through its own API.
@@ -188,7 +171,7 @@ func New(cfg Config, meter UsageMeter, policy AdmissionPolicy) *Limiter {
 		cfg:     cfg,
 		meter:   meter,
 		policy:  policy,
-		avg:     movingavg.New(sampleCapacity(cfg.Window, samplingInterval(cfg))),
+		avg:     movingavg.NewTimeWindow(cfg.Window),
 		cfgCh:   make(chan Config, 1), // coalesce updates
 		capCPUs: computeCapCPUs(cfg),
 	}
@@ -198,8 +181,8 @@ func New(cfg Config, meter UsageMeter, policy AdmissionPolicy) *Limiter {
 
 // SetConfig queues a full configuration replacement with defaults applied.
 // Calls are safe concurrently; the latest queued update replaces any pending one.
-// Run applies updates asynchronously, resizes the average while preserving the
-// newest samples that fit, and wakes waiters. Run must be active to apply updates.
+// Run applies updates asynchronously, preserves available history within the
+// new time window, and wakes waiters. Run must be active to apply updates.
 func (l *Limiter) SetConfig(cfg Config) {
 	cfg = cfg.withDefaults()
 	l.cfgUpdateMu.Lock()
@@ -286,90 +269,77 @@ func (l *Limiter) AwaitCapacity(ctx context.Context, frac float64, weight ...flo
 
 // Run is the controller loop. Call once in a goroutine with the application root
 // context; workers should use that context or descendants for AwaitCapacity.
-// Every recorded sample wakes waiters to retry admission. Failed or negative
-// meter readings are skipped; the first valid read establishes a baseline.
-// A decreasing CPU counter establishes a new baseline without clearing history.
+// Every recorded sample wakes waiters. Failed or negative reads retain history
+// and the last valid baseline. A decreasing counter clears history and establishes
+// a new baseline. Ticker times only trigger reads; measurements use actual time.
 func (l *Limiter) Run(ctx context.Context) {
-	// Initialize sampling baseline.
-	l.lastAt = time.Now()
-	haveBaseline := false
 	if cpu, err := l.meter.ProcessCPU(); err == nil && cpu >= 0 {
-		l.lastCPU = cpu
-		haveBaseline = true
+		l.recordCPU(cpu, time.Now())
 	}
-
-	// Local ticker cadence that can be changed by config updates.
 	cadence := samplingInterval(l.GetConfig())
 	tick := time.NewTicker(cadence)
 	defer tick.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
-
 		case newCfg := <-l.cfgCh:
 			l.mu.Lock()
 			old := l.cfg
 			newCadence := samplingInterval(newCfg)
 			l.cfg = newCfg
-
-			// Recompute cap CPUs under new config.
-			l.capCPUs = computeCapCPUs(l.cfg)
-
-			// Preserve recent history when changing the nominal sample window.
-			if old.Window != newCfg.Window || cadence != newCadence {
-				l.avg.Resize(sampleCapacity(newCfg.Window, newCadence))
+			l.capCPUs = computeCapCPUs(newCfg)
+			// Cadence changes do not alter interval weights or retained time.
+			if old.Window != newCfg.Window {
+				l.avg.Resize(newCfg.Window)
 			}
 			l.avgCPUs = l.avg.Avg()
-
-			// Wake all waiters to re-evaluate under the new config.
 			l.cond.Broadcast()
 			l.mu.Unlock()
-
-			// Ticker cadence may have changed.
 			if cadence != newCadence {
 				tick.Reset(newCadence)
 				cadence = newCadence
 			}
-
-		case now := <-tick.C:
-			// Sample process CPU (outside lock).
+		case <-tick.C:
 			cpu, err := l.meter.ProcessCPU()
+			measuredAt := time.Now()
 			if err != nil || cpu < 0 {
 				continue
 			}
-			if !haveBaseline || cpu < l.lastCPU {
-				l.lastAt, l.lastCPU = now, cpu
-				haveBaseline = true
-				continue
-			}
-			dtWall := now.Sub(l.lastAt)
-			if dtWall <= 0 {
-				continue
-			}
-			dtCPU := cpu - l.lastCPU
-			l.lastAt, l.lastCPU = now, cpu
-
-			// Instantaneous CPUs over this slice: Δcpu / Δwall (units: "CPUs").
-			// Divide durations directly to avoid truncating sub-microsecond values.
-			instCPUs := float64(dtCPU) / float64(dtWall)
-
-			// Update the average and cap, then notify waiters.
-			l.mu.Lock()
-			// Push into the current averaging engine.
-			l.avg.Add(instCPUs)
-			l.avgCPUs = l.avg.Avg()
-
-			// Update cap each tick (mode may be AllCores).
-			l.capCPUs = computeCapCPUs(l.cfg)
-
-			// Even a small decrease can admit a waiter; probabilistic admission
-			// also needs retries when the average is unchanged.
-			l.cond.Broadcast()
-			l.mu.Unlock()
+			l.recordCPU(cpu, measuredAt)
 		}
 	}
+}
+
+// recordCPU is owned by Run. Failed reads do not advance its baseline, so a
+// recovered reading includes both CPU and elapsed time across the gap.
+func (l *Limiter) recordCPU(cpu time.Duration, measuredAt time.Time) {
+	if l.lastAt.IsZero() {
+		l.lastAt, l.lastCPU = measuredAt, cpu
+		return
+	}
+	dtWall := measuredAt.Sub(l.lastAt)
+	if dtWall <= 0 {
+		return
+	}
+	if cpu < l.lastCPU {
+		l.lastAt, l.lastCPU = measuredAt, cpu
+		l.mu.Lock()
+		l.avg.Reset()
+		l.avgCPUs = 0
+		l.cond.Broadcast()
+		l.mu.Unlock()
+		return
+	}
+	dtCPU := cpu - l.lastCPU
+	l.lastAt, l.lastCPU = measuredAt, cpu
+	l.mu.Lock()
+	l.avg.Add(dtCPU, dtWall)
+	l.avgCPUs = l.avg.Avg()
+	l.capCPUs = computeCapCPUs(l.cfg)
+	// Retry even for unchanged usage, including probabilistic admission.
+	l.cond.Broadcast()
+	l.mu.Unlock()
 }
 
 // canProceed answers whether the caller may proceed *now*.

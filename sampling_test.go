@@ -2,12 +2,89 @@ package cpulimit
 
 import (
 	"context"
+	"math"
 	"runtime"
 	"testing"
 	"time"
 
 	"github.com/routerhsieh/cpulimiter/movingavg"
 )
+
+func TestRecordCPUUsesElapsedTimeAcrossGap(t *testing.T) {
+	cfg := regressionConfig()
+	cfg.Window = 100 * time.Millisecond
+	l := New(cfg, zeroCPUMeter{}, nil)
+	start := time.Unix(1, 0)
+	l.recordCPU(time.Second, start)
+	l.recordCPU(time.Second, start.Add(10*time.Millisecond))
+	// No successful observations in between: both CPU and wall cover the gap.
+	l.recordCPU(1900*time.Millisecond, start.Add(100*time.Millisecond))
+	if l.avgCPUs != 9 {
+		t.Fatalf("average=%g, want 9 CPU", l.avgCPUs)
+	}
+}
+
+func TestRecordCPUCounterResetAndNonIncreasingTime(t *testing.T) {
+	l := New(regressionConfig(), zeroCPUMeter{}, nil)
+	start := time.Unix(1, 0)
+	l.recordCPU(10*time.Second, start)
+	l.recordCPU(11*time.Second, start.Add(time.Second))
+	l.recordCPU(12*time.Second, start.Add(time.Second)) // Invalid timestamp.
+	l.recordCPU(13*time.Second, start.Add(2*time.Second))
+	if l.avgCPUs != 2 {
+		t.Fatalf("invalid timestamp advanced baseline: %g", l.avgCPUs)
+	}
+	l.recordCPU(time.Second, start.Add(3*time.Second))
+	if l.avgCPUs != 0 {
+		t.Fatal("counter reset retained old history")
+	}
+	l.recordCPU(1200*time.Millisecond, start.Add(4*time.Second))
+	if math.Abs(l.avgCPUs-.2) > 1e-12 {
+		t.Fatalf("new counter epoch average=%g", l.avgCPUs)
+	}
+}
+
+type delayedReadMeter struct {
+	origin time.Time
+	calls  int
+	fail   bool
+}
+
+func (m *delayedReadMeter) ProcessCPU() (time.Duration, error) {
+	time.Sleep(20 * time.Millisecond)
+	if m.origin.IsZero() {
+		m.origin = time.Now()
+	}
+	m.calls++
+	if m.fail && m.calls == 2 {
+		return -1, nil
+	}
+	return time.Since(m.origin), nil // Synthetic constant 1 CPU, measured at read time.
+}
+
+func TestRunPairsCounterWithActualReadTime(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		cfg := regressionConfig()
+		cfg.SampleEvery = time.Millisecond
+		l := New(cfg, &delayedReadMeter{fail: fail}, nil)
+		avg := &recordingAvg{TimeWindow: movingavg.NewTimeWindow(time.Second), samples: make(chan float64, 16)}
+		l.avg = avg
+		ctx, cancel := context.WithCancel(context.Background())
+		done := startController(t, l, ctx)
+		for i := 0; i < 3; i++ {
+			select {
+			case sample := <-avg.samples:
+				if math.Abs(sample-1) > .1 {
+					t.Errorf("delayed read rate=%g, want about 1 CPU (failed read=%t)", sample, fail)
+				}
+			case <-time.After(time.Second):
+				t.Error("no delayed-read sample")
+			}
+		}
+		cancel()
+		awaitStopped(t, done)
+	}
+}
 
 func TestRunPreservesSubMicrosecondCPUDelta(t *testing.T) {
 	cfg := regressionConfig()
@@ -16,7 +93,7 @@ func TestRunPreservesSubMicrosecondCPUDelta(t *testing.T) {
 		{cpu: time.Second},
 		{cpu: time.Second + 500*time.Nanosecond},
 	}}, nil)
-	avg := &recordingAvg{RingAvg: movingavg.New(1), samples: make(chan float64, 1)}
+	avg := &recordingAvg{TimeWindow: movingavg.NewTimeWindow(time.Second), samples: make(chan float64, 1)}
 	l.avg = avg
 	ctx, cancel := context.WithCancel(context.Background())
 	done := startController(t, l, ctx)
@@ -50,39 +127,26 @@ func TestSamplingIntervalByMode(t *testing.T) {
 	}
 }
 
-func TestNewRingCapacityUsesEffectiveInterval(t *testing.T) {
+func TestTimeHistoryIndependentOfSamplingCadence(t *testing.T) {
 	for _, mode := range []Mode{SingleCore, AllCores} {
 		cfg := regressionConfig()
-		cfg.Mode = mode
-		cfg.Window, cfg.SampleEvery = 10*time.Millisecond, 10*time.Millisecond
-		expected := sampleCapacity(cfg.Window, samplingInterval(cfg))
+		cfg.Mode, cfg.Window, cfg.SampleEvery = mode, 10*time.Millisecond, 10*time.Millisecond
 		l := New(cfg, zeroCPUMeter{}, nil)
-		// Feed one more sample than capacity and check that exactly the oldest
-		// sample is evicted, without exposing the ring's internal fields.
-		for i := 1; i <= expected+1; i++ {
-			l.avg.Add(float64(i))
-		}
-		want := float64(expected+3) / 2
-		if got := l.avg.Avg(); got != want {
-			t.Fatalf("mode %d: average=%g, want %g for capacity %d", mode, got, want, expected)
+		l.avg.Add(time.Millisecond, 2*time.Millisecond)
+		l.avg.Add(9*time.Millisecond, 8*time.Millisecond)
+		if got := l.avg.Avg(); got != 1 {
+			t.Fatalf("mode %d: average=%g, want 1 from actual CPU/time", mode, got)
 		}
 	}
 }
-
-type resizeTrackingAvg struct {
-	*movingavg.RingAvg
-	capacity int // Accessed only under the limiter's mutex.
-}
-
-func (a *resizeTrackingAvg) Resize(n int) { a.RingAvg.Resize(n); a.capacity = n }
 
 func TestRuntimeModeWindowAndCadenceResize(t *testing.T) {
 	cfg := regressionConfig()
 	cfg.Window, cfg.SampleEvery = 2*time.Hour, time.Hour
 	l := New(cfg, zeroCPUMeter{}, nil)
-	avg := &resizeTrackingAvg{RingAvg: movingavg.New(2), capacity: 2}
-	avg.Add(1)
-	avg.Add(2)
+	avg := movingavg.NewTimeWindow(2 * time.Hour)
+	avg.Add(time.Hour, time.Hour)
+	avg.Add(2*time.Hour, time.Hour)
 	l.avg, l.avgCPUs = avg, avg.Avg()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := startController(t, l, ctx)
@@ -99,15 +163,11 @@ func TestRuntimeModeWindowAndCadenceResize(t *testing.T) {
 		cfg.Mode, cfg.Window, cfg.SampleEvery = update.mode, update.window, update.every
 		l.SetConfig(cfg)
 		awaitCondition(t, "mode/window/cadence update", func() bool { return l.GetConfig() == cfg.withDefaults() })
-		wantCapacity := sampleCapacity(cfg.Window, samplingInterval(cfg))
 		l.mu.Lock()
-		capacity, cached := avg.capacity, l.avgCPUs
+		cached := l.avgCPUs
 		l.mu.Unlock()
-		if capacity != wantCapacity {
-			t.Fatalf("capacity=%d, want %d for %+v", capacity, wantCapacity, cfg)
-		}
 		wantAvg := 1.5
-		if wantCapacity == 1 {
+		if cfg.Window == time.Hour {
 			wantAvg = 2
 		}
 		if cached != wantAvg {

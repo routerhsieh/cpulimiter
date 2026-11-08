@@ -43,41 +43,6 @@ func awaitStopped(t *testing.T, done <-chan struct{}) {
 	}
 }
 
-func TestSampleCapacity(t *testing.T) {
-	for _, tt := range []struct {
-		name          string
-		window, every time.Duration
-		want          int
-	}{
-		{"five minutes", 5 * time.Minute, 100 * time.Millisecond, 3000},
-		{"round up", 10 * time.Millisecond, 3 * time.Millisecond, 4},
-		{"short window", time.Millisecond, time.Second, 1},
-		{"equal", time.Second, time.Second, 1},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := sampleCapacity(tt.window, tt.every); got != tt.want {
-				t.Fatalf("capacity=%d, want %d", got, tt.want)
-			}
-		})
-	}
-	for _, tt := range []struct {
-		name          string
-		window, every time.Duration
-	}{
-		{"zero window", 0, time.Second}, {"negative window", -1, time.Second},
-		{"zero interval", time.Second, 0}, {"negative interval", time.Second, -1},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			defer func() {
-				if recover() == nil {
-					t.Fatal("expected invalid-duration panic")
-				}
-			}()
-			sampleCapacity(tt.window, tt.every)
-		})
-	}
-}
-
 func TestConfigNormalizesNonfiniteHysteresis(t *testing.T) {
 	for _, invalid := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
 		t.Run(fmtFloat(invalid), func(t *testing.T) {
@@ -220,7 +185,7 @@ func TestRuntimeResizePreservesHistory(t *testing.T) {
 	cfg.Window, cfg.SampleEvery = 4*time.Hour, time.Hour
 	l := New(cfg, zeroCPUMeter{}, nil)
 	for _, v := range []float64{1, 2, 3, 4} {
-		l.avg.Add(v)
+		l.avg.Add(time.Duration(v)*time.Hour, time.Hour)
 	}
 	l.avgCPUs = l.avg.Avg()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -231,23 +196,35 @@ func TestRuntimeResizePreservesHistory(t *testing.T) {
 	awaitCondition(t, "window update", func() bool { return l.GetConfig().Window == cfg.Window })
 	l.mu.Lock()
 	got := l.avgCPUs
-	l.avg.Add(5)
+	l.avg.Add(5*time.Hour, time.Hour)
 	afterAdd := l.avg.Avg()
 	l.mu.Unlock()
 	if got != 3.5 || afterAdd != 4.5 {
 		t.Fatalf("shrink: cached average=%g, after adding=%g; want 3.5 and 4.5", got, afterAdd)
 	}
-	cfg.SampleEvery = 30 * time.Minute // Grow from two to four retained samples.
+	cfg.SampleEvery = 30 * time.Minute // Cadence changes must not grow history.
 	l.SetConfig(cfg)
 	awaitCondition(t, "cadence update", func() bool { return l.GetConfig().SampleEvery == cfg.SampleEvery })
 	l.mu.Lock()
 	got = l.avgCPUs
-	l.avg.Add(6)
-	l.avg.Add(7)
+	l.avg.Add(6*time.Hour, time.Hour)
+	l.avg.Add(7*time.Hour, time.Hour)
 	afterAdd = l.avg.Avg()
 	l.mu.Unlock()
-	if got != 4.5 || afterAdd != 5.5 {
-		t.Fatalf("grow: average=%g, after adding=%g; want 4.5 and 5.5", got, afterAdd)
+	if got != 4.5 || afterAdd != 6.5 {
+		t.Fatalf("cadence: average=%g, after adding=%g; want 4.5 and 6.5", got, afterAdd)
+	}
+	cfg.Window = 4 * time.Hour
+	l.SetConfig(cfg)
+	awaitCondition(t, "window growth", func() bool { return l.GetConfig().Window == cfg.Window })
+	l.mu.Lock()
+	got = l.avgCPUs
+	l.avg.Add(8*time.Hour, time.Hour)
+	l.avg.Add(9*time.Hour, time.Hour)
+	afterAdd = l.avg.Avg()
+	l.mu.Unlock()
+	if got != 6.5 || afterAdd != 7.5 {
+		t.Fatalf("grow: average=%g, after adding=%g; want 6.5 and 7.5", got, afterAdd)
 	}
 }
 
@@ -270,11 +247,14 @@ func (m *scriptedMeter) ProcessCPU() (time.Duration, error) {
 }
 
 type recordingAvg struct {
-	*movingavg.RingAvg
+	*movingavg.TimeWindow
 	samples chan float64
 }
 
-func (a *recordingAvg) Add(v float64) { a.RingAvg.Add(v); a.samples <- v }
+func (a *recordingAvg) Add(cpu, wall time.Duration) {
+	a.TimeWindow.Add(cpu, wall)
+	a.samples <- float64(cpu) / float64(wall)
+}
 
 func TestRunMeterFailuresAndCounterRollback(t *testing.T) {
 	for _, tt := range []struct {
@@ -288,7 +268,7 @@ func TestRunMeterFailuresAndCounterRollback(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			l := New(regressionConfig(), &scriptedMeter{readings: tt.readings}, nil)
-			avg := &recordingAvg{RingAvg: movingavg.New(10), samples: make(chan float64, 16)}
+			avg := &recordingAvg{TimeWindow: movingavg.NewTimeWindow(time.Second), samples: make(chan float64, 16)}
 			l.avg = avg
 			ctx, cancel := context.WithCancel(context.Background())
 			done := startController(t, l, ctx)
@@ -327,7 +307,7 @@ func (failingMeter) ProcessCPU() (time.Duration, error) { return 0, errors.New("
 
 func TestMeterFailureKeepsHistoryAndAllowsConfigUpdates(t *testing.T) {
 	l := New(regressionConfig(), failingMeter{}, nil)
-	l.avg.Add(0.9)
+	l.avg.Add(900*time.Millisecond, time.Second)
 	l.avgCPUs = l.avg.Avg()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := startController(t, l, ctx)
@@ -353,7 +333,7 @@ func TestConfigUpdateRaisesCapAndWakesWaiter(t *testing.T) {
 	cfg := regressionConfig()
 	cfg.SampleEvery, cfg.Window = time.Hour, time.Hour
 	l := New(cfg, zeroCPUMeter{}, nil)
-	l.avg.Add(0.9)
+	l.avg.Add(900*time.Millisecond, time.Second)
 	l.avgCPUs = 0.9
 	root, cancel := context.WithCancel(context.Background())
 	defer cancel()

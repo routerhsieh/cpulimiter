@@ -110,8 +110,9 @@ func TestNewDefaultsWindow(t *testing.T) {
 	if cfg.Window <= 0 {
 		t.Fatal("default Window must be positive")
 	}
-	if sampleCapacity(cfg.Window, cfg.SampleEvery) < 1 {
-		t.Fatal("default average must have positive capacity")
+	l.avg.Add(time.Second, time.Second)
+	if l.avg.Avg() != 1 {
+		t.Fatal("default time window must accept measured intervals")
 	}
 }
 
@@ -123,7 +124,7 @@ type notificationAvg struct {
 	updated chan struct{}
 }
 
-func (a *notificationAvg) Add(float64) {
+func (a *notificationAvg) Add(time.Duration, time.Duration) {
 	a.n++
 	a.value = 0.69
 	if a.n > 1 {
@@ -134,8 +135,10 @@ func (a *notificationAvg) Add(float64) {
 	default:
 	}
 }
-func (a *notificationAvg) Avg() float64 { return a.value }
-func (*notificationAvg) Resize(int)     {}
+func (a *notificationAvg) Avg() float64       { return a.value }
+func (*notificationAvg) Resize(time.Duration) {}
+
+func (*notificationAvg) Reset() {}
 
 type gatedCPUMeter struct {
 	calls   int
