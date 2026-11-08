@@ -248,6 +248,28 @@ go test -race ./...
 
 ## Development
 
+With Go and GNU Make installed, run from the repository root:
+
+```sh
+make build          # Host build; example executable in build/native/
+make test           # Unit tests on the current platform
+make test-race      # Race checks; requires CGO and a C compiler
+make build-all      # Cross-build all supported platforms
+make clean          # Remove build output (BUILD_DIR, default: build/)
+```
+
+Cross-builds cover Linux, macOS (`darwin`), Windows, and FreeBSD on `amd64` and
+`arm64`. Use `make build-linux` (or `build-darwin`, `build-windows`,
+`build-freebsd`) for one platform, and `ARCHES=amd64` to select one architecture.
+Example executables go into `build/<os>/<arch>/`, with `.exe` on Windows.
+Library packages are compile-checked rather than emitted as standalone binaries.
+Override `GO` or `BUILD_DIR` if needed; `make help` lists the available targets.
+
+Cross-builds disable CGO and validate compilation only. Run `make test` and
+`make test-race` on each target system for native test coverage; cross-building
+does not validate CPU throttling behavior on that system. On Windows, use an
+environment providing GNU Make and a POSIX shell, such as MSYS2.
+
 This project was developed with AI assistance, including OpenAI Codex, for
 design discussions, implementation, tests, and documentation. The maintainer
 makes the design decisions and is responsible for reviewing changes and

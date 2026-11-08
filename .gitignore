@@ -3,6 +3,7 @@
 *.test
 *.test.exe
 /hashing
+/build/
 
 # Generated coverage reports
 /coverage.out
